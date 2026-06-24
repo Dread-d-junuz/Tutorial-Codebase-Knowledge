@@ -104,7 +104,7 @@ def crawl_github_files(
 
                     # Read content
                     try:
-                        with open(abs_path, "r", encoding="utf-8") as f:
+                        with open(abs_path, "r", encoding="utf-8-sig") as f:
                             content = f.read()
                         files[rel_path] = content
                         print(f"Added {rel_path} ({file_size} bytes)")
@@ -135,21 +135,77 @@ def crawl_github_files(
     owner = path_parts[0]
     repo = path_parts[1]
     
-    # Check if URL contains a specific branch/commit
-    if 'tree' in path_parts:
-        tree_index = path_parts.index('tree')
-        ref = path_parts[tree_index + 1]
-        # Combine all parts after the ref as the path
-        path_start = tree_index + 2
-        specific_path = '/'.join(path_parts[path_start:]) if path_start < len(path_parts) else ""
-    else:
-        ref = "main"  # Default branch
-        specific_path = ""
-    
     # Setup for GitHub API
     headers = {"Accept": "application/vnd.github.v3+json"}
     if token:
         headers["Authorization"] = f"token {token}"
+
+    def fetch_branches(owner: str, repo: str):
+        """Get brancshes of the repository"""
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/branches"
+        response = requests.get(url, headers=headers, timeout=(30, 30))
+
+        if response.status_code == 404:
+            if not token:
+                print(f"Error 404: Repository not found or is private.\n"
+                      f"If this is a private repository, please provide a valid GitHub token via the 'token' argument or set the GITHUB_TOKEN environment variable.")
+            else:
+                print(f"Error 404: Repository not found or insufficient permissions with the provided token.\n"
+                      f"Please verify the repository exists and the token has access to this repository.")
+            return []
+            
+        if response.status_code != 200:
+            print(f"Error fetching the branches of {owner}/{repo}: {response.status_code} - {response.text}")
+            return []
+
+        return response.json()
+
+    def check_tree(owner: str, repo: str, tree: str):
+        """Check the repository has the given tree"""
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{tree}"
+        response = requests.get(url, headers=headers, timeout=(30, 30))
+
+        return True if response.status_code == 200 else False 
+
+    # Check if URL contains a specific branch/commit
+    if len(path_parts) > 2 and 'tree' == path_parts[2]:
+        join_parts = lambda i: '/'.join(path_parts[i:])
+
+        branches = fetch_branches(owner, repo)
+        branch_names = map(lambda branch: branch.get("name"), branches)
+
+        # Fetching branches is not successfully
+        if len(branches) == 0:
+            return
+
+        # To check branch name
+        relevant_path = join_parts(3)
+
+        # Find a match with relevant path and get the branch name
+        filter_gen = (name for name in branch_names if relevant_path.startswith(name))
+        ref = next(filter_gen, None)
+
+        # If match is not found, check for is it a tree
+        if ref == None:
+            tree = path_parts[3]
+            ref = tree if check_tree(owner, repo, tree) else None
+
+        # If it is neither a tree nor a branch name
+        if ref == None:
+            print(f"The given path does not match with any branch and any tree in the repository.\n"
+                  f"Please verify the path is exists.")
+            return
+
+        # Combine all parts after the ref as the path
+        part_index = 5 if '/' in ref else 4
+        specific_path = join_parts(part_index) if part_index < len(path_parts) else ""
+    else:
+        # Dont put the ref param to quiery
+        # and let Github decide default branch
+        ref = None
+        specific_path = ""
     
     # Dictionary to store path -> content mapping
     files = {}
@@ -158,9 +214,9 @@ def crawl_github_files(
     def fetch_contents(path):
         """Fetch contents of the repository at a specific path and commit"""
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        params = {"ref": ref}
+        params = {"ref": ref} if ref != None else {}
         
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=(30, 30))
         
         if response.status_code == 403 and 'rate limit exceeded' in response.text.lower():
             reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
@@ -173,6 +229,9 @@ def crawl_github_files(
             if not token:
                 print(f"Error 404: Repository not found or is private.\n"
                       f"If this is a private repository, please provide a valid GitHub token via the 'token' argument or set the GITHUB_TOKEN environment variable.")
+            elif not path and ref == 'main':
+                print(f"Error 404: Repository not found. Check if the default branch is not 'main'\n"
+                      f"Try adding branch name to the request i.e. python main.py --repo https://github.com/username/repo/tree/master")
             else:
                 print(f"Error 404: Path '{path}' not found in repository or insufficient permissions with the provided token.\n"
                       f"Please verify the token has access to this repository and the path exists.")
@@ -217,7 +276,7 @@ def crawl_github_files(
                 # For files, get raw content
                 if "download_url" in item and item["download_url"]:
                     file_url = item["download_url"]
-                    file_response = requests.get(file_url, headers=headers)
+                    file_response = requests.get(file_url, headers=headers, timeout=(30, 30))
                     
                     # Final size check in case content-length header is available but differs from metadata
                     content_length = int(file_response.headers.get('content-length', 0))
@@ -233,7 +292,7 @@ def crawl_github_files(
                         print(f"Failed to download {rel_path}: {file_response.status_code}")
                 else:
                     # Alternative method if download_url is not available
-                    content_response = requests.get(item["url"], headers=headers)
+                    content_response = requests.get(item["url"], headers=headers, timeout=(30, 30))
                     if content_response.status_code == 200:
                         content_data = content_response.json()
                         if content_data.get("encoding") == "base64" and "content" in content_data:
@@ -253,7 +312,19 @@ def crawl_github_files(
                         print(f"Failed to get content for {rel_path}: {content_response.status_code}")
             
             elif item["type"] == "dir":
-                # Recursively process subdirectories
+                # OLD IMPLEMENTATION (comment this block to test new implementation)
+                # Always recurse into directories without checking exclusions first
+                # fetch_contents(item_path)
+
+                # NEW IMPLEMENTATION (uncomment this block to test optimized version)
+                # # Check if directory should be excluded before recursing
+                if exclude_patterns:
+                    dir_excluded = any(fnmatch.fnmatch(item_path, pattern) or
+                                    fnmatch.fnmatch(rel_path, pattern) for pattern in exclude_patterns)
+                    if dir_excluded:
+                        continue
+                
+                # # Only recurse if directory is not excluded
                 fetch_contents(item_path)
     
     # Start crawling from the specified path
